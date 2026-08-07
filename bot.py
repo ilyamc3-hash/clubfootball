@@ -184,7 +184,7 @@ MAX_GOALS = 8
 
 # Твой Telegram user_id (не username!) — узнать можно у @userinfobot.
 # Только эти ID смогут пользоваться /admin_* командами.
-ADMIN_IDS = {0}  # ЗАМЕНИ 0 на свой реальный Telegram user_id
+ADMIN_IDS = {1198125643}
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
