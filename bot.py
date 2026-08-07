@@ -1,14 +1,16 @@
 """
 Football Prediction Lab — Telegram-бот (aiogram 3).
 
-Оборачивает уже проверенную логику (Elo+Form+Momentum, Пуассон-модель)
-в команды бота. Данные читаются из той же football.db.
+ЧМ-2026 завершён — бот работает по Ла Лиге (LaLigaModel: Elo + HomeAdvantage,
+без Form/Momentum — отключены как вредные по ablation-тесту). Пуассон-модель
+(attack/defense по забитым голам) используется отдельно для тоталов/симуляции.
+Данные читаются из той же football.db.
 
 Команды:
-    /today     — автопоиск ближайших матчей + прогноз П1/Х/П2 (Elo-модель)
+    /liga      — автопоиск ближайших матчей Ла Лиги + прогноз П1/Х/П2
     /totals    — тоталы и "обе забьют" по ближайшим матчам (Пуассон-модель)
-    /match Франция Испания   — прогноз на конкретную пару вручную
-    /ratings   — топ-15 команд по текущему рейтингу
+    /match Реал Мадрид Барселона   — прогноз на конкретную пару клубов вручную
+    /ratings   — топ-15 клубов по текущему рейтингу
 
 Установка:
     pip install aiogram --break-system-packages   (на Windows: pip install aiogram)
@@ -25,8 +27,8 @@ Football Prediction Lab — Telegram-бот (aiogram 3).
 import asyncio
 import logging
 import os
+import re
 import sqlite3
-import statistics
 import math
 import random
 import sys
@@ -38,73 +40,146 @@ load_dotenv()
 from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
-from laliga_model import LaLigaModel
+from laliga_model import LaLigaModel, HOME_ADVANTAGE, predict_probs
 
-laliga_model = None  # строится лениво при первом обращении к /liga, чтобы не тормозить старт бота
+laliga_model = None  # строится лениво при первом обращении к клубным командам, чтобы не тормозить старт бота
 
-from fifa_ratings import get_starting_elo
-
-# Соответствие русских названий команд английским (как они хранятся в football.db,
-# т.к. они приходят из football-data.org). Позволяет писать /match Испания Аргентина
-# вместо /match Spain Argentina — бот сам поймёт по-русски.
-TEAM_ALIASES = {
-    "аргентина": "Argentina", "испания": "Spain", "франция": "France",
-    "англия": "England", "португалия": "Portugal", "бразилия": "Brazil",
-    "марокко": "Morocco", "нидерланды": "Netherlands", "бельгия": "Belgium",
-    "германия": "Germany", "хорватия": "Croatia", "колумбия": "Colombia",
-    "мексика": "Mexico", "сенегал": "Senegal", "уругвай": "Uruguay",
-    "сша": "United States", "япония": "Japan", "швейцария": "Switzerland",
-    "иран": "Iran", "турция": "Turkey", "эквадор": "Ecuador",
-    "австрия": "Austria", "южная корея": "South Korea", "австралия": "Australia",
-    "алжир": "Algeria", "египет": "Egypt", "канада": "Canada",
-    "норвегия": "Norway", "кот-д'ивуар": "Ivory Coast", "панама": "Panama",
-    "швеция": "Sweden", "чехия": "Czechia", "парагвай": "Paraguay",
-    "шотландия": "Scotland", "тунис": "Tunisia", "др конго": "Congo DR",
-    "юар": "South Africa", "саудовская аравия": "Saudi Arabia", "иордания": "Jordan",
-    "босния и герцеговина": "Bosnia-Herzegovina", "узбекистан": "Uzbekistan",
-    "ирак": "Iraq", "новая зеландия": "New Zealand", "кабо-верде": "Cape Verde Islands",
-    "кюрасао": "Curaçao", "гаити": "Haiti", "катар": "Qatar", "гана": "Ghana",
-    # дополнительные варианты написания (без дефиса) для многословных названий
-    "кабо верде": "Cape Verde Islands",
-    "кот д'ивуар": "Ivory Coast", "кот дивуар": "Ivory Coast",
+# Русские алиасы клубов Ла Лиги -> имя, как оно хранится в football.db
+# (приходит из football-data.org). Намеренно НЕ включает короткие
+# неоднозначные токены вроде "реал" или "депортиво" — они разрешаются
+# через частичное совпадение в resolve_club_name(), которое само
+# обнаруживает и репортит неоднозначность, а не молча выбирает один клуб.
+CLUB_ALIASES = {
+    "атлетик бильбао": "Athletic Club", "атлетик": "Athletic Club",
+    "осасуна": "CA Osasuna",
+    "атлетико мадрид": "Club Atlético de Madrid", "атлетико": "Club Atlético de Madrid",
+    "алавес": "Deportivo Alavés", "депортиво алавес": "Deportivo Alavés",
+    "эльче": "Elche CF",
+    "барселона": "FC Barcelona",
+    "хетафе": "Getafe CF",
+    "леванте": "Levante UD",
+    "малага": "Málaga CF",
+    "сельта": "RC Celta de Vigo", "сельта виго": "RC Celta de Vigo",
+    "депортиво ла корунья": "RC Deportivo La Coruña",
+    "эспаньол": "RCD Espanyol de Barcelona",
+    "райо вальекано": "Rayo Vallecano de Madrid", "райо": "Rayo Vallecano de Madrid",
+    "реал бетис": "Real Betis Balompié", "бетис": "Real Betis Balompié",
+    "реал мадрид": "Real Madrid CF",
+    "расинг сантандер": "Real Racing Club de Santander",
+    "реал сосьедад": "Real Sociedad de Fútbol", "сосьедад": "Real Sociedad de Fútbol",
+    "севилья": "Sevilla FC",
+    "валенсия": "Valencia CF",
+    "вильярреал": "Villarreal CF",
 }
 
 
-def normalize_team_name(name: str) -> str:
-    """Приводит введённое название к тому виду, что хранится в базе.
-    Понимает и русское, и английское название (регистр не важен)."""
-    key = name.strip().lower()
-    if key in TEAM_ALIASES:
-        return TEAM_ALIASES[key]
-    return name.strip()  # если не нашли — пробуем как есть (вдруг уже по-английски с нужным регистром)
+def get_known_pd_teams(conn):
+    """Список названий клубов Ла Лиги как они хранятся в football.db (имена football-data.org)."""
+    rows = conn.execute("""
+        SELECT DISTINCT t.name FROM teams t
+        JOIN matches m ON t.id = m.home_team_id OR t.id = m.away_team_id
+        WHERE m.competition_code = 'PD'
+    """).fetchall()
+    return [r[0] for r in rows]
 
 
-KNOWN_TEAMS = set(TEAM_ALIASES.values())
+def _contains_as_word(haystack: str, needle: str) -> bool:
+    """Проверяет вхождение needle в haystack по границам слов, а не как
+    голый substring — иначе "real" находился бы и внутри "Villarreal"."""
+    return re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack) is not None
 
 
-def team_recognized(name: str) -> bool:
-    return name in KNOWN_TEAMS
+def resolve_club_name(raw_name, known_names):
+    """Пытается однозначно определить клуб по вводу пользователя.
+
+    Возвращает (имя, None) при однозначном совпадении,
+    (None, [кандидаты]) при неоднозначности (нужно уточнение у пользователя),
+    (None, []) если вообще ничего не найдено.
+
+    Тиры проверки (от точных к размытым): точный алиас -> точное английское
+    имя -> частичное совпадение по алиасам -> частичное совпадение по
+    английским именам. Частичные тиры могут дать несколько разных клубов
+    (например "реал" -> Реал Мадрид/Сосьедад/Бетис) — в этом случае
+    результат считается неоднозначным, а не берётся первый попавшийся.
+    """
+    normalized = raw_name.strip().lower()
+    if not normalized:
+        return None, []
+
+    if normalized in CLUB_ALIASES:
+        return CLUB_ALIASES[normalized], None
+
+    for name in known_names:
+        if name.lower() == normalized:
+            return name, None
+
+    alias_matches = sorted({v for k, v in CLUB_ALIASES.items() if _contains_as_word(k, normalized)})
+    if len(alias_matches) == 1:
+        return alias_matches[0], None
+    if len(alias_matches) > 1:
+        return None, alias_matches
+
+    name_matches = sorted({name for name in known_names if _contains_as_word(name.lower(), normalized)})
+    if len(name_matches) == 1:
+        return name_matches[0], None
+    if len(name_matches) > 1:
+        return None, name_matches
+
+    return None, []
 
 
-def parse_two_teams(tokens):
-    """Пытается разбить список слов на два названия команд, перебирая
-    точку разреза — так двухсловные названия вроде 'Кабо Верде' или
-    'Южная Корея' распознаются правильно, а не рвутся пополам."""
+def parse_two_clubs(tokens, known_names):
+    """Аналог parse_two_teams, но для клубов: перебирает точку разреза
+    многословного ввода и требует, чтобы ОБЕ половины разрешились
+    однозначно через resolve_club_name. Возвращает
+    (team_a, team_b, ambiguous_a, ambiguous_b) — team_x is None, если
+    не распознано или неоднозначно (тогда ambiguous_x — список кандидатов
+    или пустой список, если вообще не распознано)."""
     n = len(tokens)
     for k in range(1, n):
-        part1 = normalize_team_name(" ".join(tokens[:k]))
-        part2 = normalize_team_name(" ".join(tokens[k:]))
-        if team_recognized(part1) and team_recognized(part2):
-            return part1, part2
-    # ничего не распозналось полностью — запасной вариант: первое слово / остальное
-    part1 = normalize_team_name(tokens[0])
-    part2 = normalize_team_name(" ".join(tokens[1:]))
-    return part1, part2
+        part1 = " ".join(tokens[:k])
+        part2 = " ".join(tokens[k:])
+        r1, _ = resolve_club_name(part1, known_names)
+        r2, _ = resolve_club_name(part2, known_names)
+        if r1 and r2:
+            return r1, r2, None, None
+
+    # ни один разрез не дал однозначного результата с обеих сторон —
+    # запасной вариант: первое слово / остальное, с честным репортом
+    # неоднозначности/нераспознавания по каждой половине отдельно
+    part1 = tokens[0]
+    part2 = " ".join(tokens[1:])
+    r1, amb1 = resolve_club_name(part1, known_names)
+    r2, amb2 = resolve_club_name(part2, known_names)
+    return r1, r2, (amb1 if not r1 else None), (amb2 if not r2 else None)
+
+
+async def ensure_laliga_model(message: Message):
+    """Обеспечивает актуальную (пересобранную при необходимости) модель
+    Ла Лиги. При ошибке отсутствующих файлов отвечает пользователю сама
+    и возвращает None — вызывающий обработчик должен в этом случае просто
+    завершиться (return)."""
+    global laliga_model
+    current_finished = LaLigaModel.count_finished_pd(DB_PATH)
+    needs_rebuild = (
+        laliga_model is None
+        or laliga_model.db_finished_count != current_finished
+    )
+    if needs_rebuild:
+        try:
+            laliga_model = LaLigaModel(db_path=DB_PATH)
+        except FileNotFoundError as e:
+            await message.answer(
+                f"Не найдены файлы модели Ла Лиги ({e.filename}). "
+                f"Нужны laliga_matches_combined.csv и team_name_mapping.csv "
+                f"в папке с bot.py."
+            )
+            return None
+    return laliga_model
+
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = "football.db"
-K_FACTOR = 32
-FORM_MOMENTUM_WEIGHT = 15
 MAX_GOALS = 8
 
 # Твой Telegram user_id (не username!) — узнать можно у @userinfobot.
@@ -117,19 +192,6 @@ dp = Dispatcher()
 
 
 # ---------- Общая логика (та же, что в compute_ratings.py / predict_match.py) ----------
-
-def mov_multiplier(goal_diff, elo_diff_pre_match):
-    goal_diff = abs(goal_diff)
-    if goal_diff == 0:
-        return 1.0
-    return math.log(goal_diff + 1) * (2.2 / ((abs(elo_diff_pre_match) * 0.001) + 2.2))
-
-
-def draw_probability(effective_diff):
-    base = 0.28
-    penalty = min(0.20, (abs(effective_diff) / 400) ** 1.5 * 0.18)
-    return max(0.06, base - penalty)
-
 
 def load_finished_matches(conn, competition_code="WC"):
     cur = conn.execute("""
@@ -166,100 +228,6 @@ def find_upcoming_matches(conn, competition_code="WC"):
         if (dt - earliest).total_seconds() <= 20 * 3600:
             window.append((match_id, h, a))
     return window, rows[0][1][:16]
-
-
-def build_elo_form_momentum(matches):
-    elo, seq = {}, {}
-
-    def get_elo(t):
-        return elo.setdefault(t, get_starting_elo(t))
-
-    for _, home, away, hg, ag in matches:
-        r_home, r_away = get_elo(home), get_elo(away)
-        exp_home = 1 / (1 + 10 ** ((r_away - r_home) / 400))
-        score_home = 1.0 if hg > ag else (0.0 if hg < ag else 0.5)
-        mult = mov_multiplier(hg - ag, r_home - r_away)
-        k_eff = K_FACTOR * mult
-        elo[home] = r_home + k_eff * (score_home - exp_home)
-        elo[away] = r_away + k_eff * ((1 - score_home) - (1 - exp_home))
-        seq.setdefault(home, []).append((hg, ag))
-        seq.setdefault(away, []).append((ag, hg))
-
-    form, momentum = {}, {}
-    for team, games in seq.items():
-        total, wsum = 0.0, 0.0
-        for i, (gf, ga) in enumerate(games):
-            w = i + 1
-            pts = 4 if gf > ga else (1 if gf == ga else -3)
-            total += pts * w
-            wsum += w
-        form[team] = total / wsum if wsum else 0.0
-
-        goals = [gf for gf, _ in games]
-        if len(goals) < 2:
-            momentum[team] = 0.0
-        else:
-            mid = len(goals) // 2
-            early = goals[:mid] or goals[:1]
-            late = goals[mid:] or goals[-1:]
-            momentum[team] = statistics.mean(late) - statistics.mean(early)
-
-    return elo, form, momentum
-
-
-def predict_elo(team_a, team_b, elo, form, momentum):
-    elo_a = elo.get(team_a, get_starting_elo(team_a))
-    elo_b = elo.get(team_b, get_starting_elo(team_b))
-    form_a, form_b = form.get(team_a, 0.0), form.get(team_b, 0.0)
-    mom_a, mom_b = momentum.get(team_a, 0.0), momentum.get(team_b, 0.0)
-    diff = (elo_a - elo_b) + (form_a - form_b) * FORM_MOMENTUM_WEIGHT + (mom_a - mom_b) * FORM_MOMENTUM_WEIGHT
-    expected_a = 1 / (1 + 10 ** (-diff / 400))
-    p_draw = draw_probability(diff)
-    p_a = max(0.0, expected_a - p_draw / 2)
-    p_b = max(0.0, (1 - expected_a) - p_draw / 2)
-    total = p_a + p_draw + p_b
-    return p_a / total, p_draw / total, p_b / total, elo_a, elo_b
-
-
-def _stage_probs(diff):
-    """Вспомогательная: те же формулы, что в predict_elo, но принимает готовую
-    'эффективную разницу' — нужна, чтобы посчитать вероятность на каждом
-    промежуточном этапе (только Elo / Elo+Form / Elo+Form+Momentum)."""
-    expected_a = 1 / (1 + 10 ** (-diff / 400))
-    p_draw = draw_probability(diff)
-    p_a = max(0.0, expected_a - p_draw / 2)
-    p_b = max(0.0, (1 - expected_a) - p_draw / 2)
-    total = p_a + p_draw + p_b
-    return p_a / total, p_draw / total, p_b / total
-
-
-def explain_prediction(team_a, team_b, elo, form, momentum):
-    """Раскладывает итоговую вероятность победы team_a на вклад каждого
-    компонента модели: сначала считаем только по Elo, потом добавляем
-    Form, потом Momentum — разница между этапами и есть вклад фактора.
-    Не идеальный SHAP, но честный и прозрачный способ показать 'почему'."""
-    elo_a = elo.get(team_a, get_starting_elo(team_a))
-    elo_b = elo.get(team_b, get_starting_elo(team_b))
-    form_a, form_b = form.get(team_a, 0.0), form.get(team_b, 0.0)
-    mom_a, mom_b = momentum.get(team_a, 0.0), momentum.get(team_b, 0.0)
-
-    diff_elo_only = elo_a - elo_b
-    diff_with_form = diff_elo_only + (form_a - form_b) * FORM_MOMENTUM_WEIGHT
-    diff_full = diff_with_form + (mom_a - mom_b) * FORM_MOMENTUM_WEIGHT
-
-    p_home_base = _stage_probs(diff_elo_only)[0]
-    p_home_with_form = _stage_probs(diff_with_form)[0]
-    p_home_final = _stage_probs(diff_full)[0]
-
-    form_contribution = (p_home_with_form - p_home_base) * 100
-    momentum_contribution = (p_home_final - p_home_with_form) * 100
-
-    return {
-        "base_elo_pct": p_home_base * 100,
-        "form_contribution": form_contribution,
-        "momentum_contribution": momentum_contribution,
-        "final_pct": p_home_final * 100,
-    }
 
 
 def poisson_pmf(k, lam):
@@ -461,58 +429,13 @@ class UserTrackingMiddleware(BaseMiddleware):
 
 @dp.message(Command("today"))
 async def cmd_today(message: Message):
-    conn = sqlite3.connect(DB_PATH)
-    ensure_predictions_table(conn)
-    reconcile_predictions(conn)  # тихо сверяем всё, что уже можно сверить
-
-    finished = load_finished_matches(conn, competition_code="WC")
-    upcoming, when = find_upcoming_matches(conn, competition_code="WC")
-
-    if not upcoming:
-        await message.answer("Не найдено предстоящих матчей. Нужно обновить базу (fetch_matches.py).")
-        conn.close()
-        return
-
-    elo, form, momentum = build_elo_form_momentum(finished)
-    attack, defense, league_avg = build_attack_defense(finished)
-
-    lines = [f"⚽ Ближайшие матчи ({when} UTC):\n"]
-    for match_id, team_a, team_b in upcoming:
-        p_a, p_draw, p_b, elo_a, elo_b = predict_elo(team_a, team_b, elo, form, momentum)
-        save_prediction(conn, match_id, team_a, team_b, p_a, p_draw, p_b)
-
-        lines.append(f"<b>{team_a} — {team_b}</b>")
-        lines.append(f"Elo: {elo_a:.0f} vs {elo_b:.0f}")
-        lines.append(f"П1 {p_a*100:.1f}%  Х {p_draw*100:.1f}%  П2 {p_b*100:.1f}%")
-
-        # Explainability — из чего складывается вероятность team_a
-        exp = explain_prediction(team_a, team_b, elo, form, momentum)
-        lines.append(f"<i>Как получилась цифра для {team_a}:</i>")
-        lines.append(f"  База (только Elo): {exp['base_elo_pct']:.1f}%")
-        lines.append(f"  {'+' if exp['form_contribution']>=0 else ''}{exp['form_contribution']:.1f}% форма")
-        lines.append(f"  {'+' if exp['momentum_contribution']>=0 else ''}{exp['momentum_contribution']:.1f}% momentum")
-        lines.append(f"  = Итог: {exp['final_pct']:.1f}%")
-
-        # Самое вероятное — исход с наибольшей вероятностью + степень уверенности
-        outcomes = [("П1", p_a, team_a), ("Х", p_draw, None), ("П2", p_b, team_b)]
-        best_label, best_p, best_team = max(outcomes, key=lambda x: x[1])
-        gap = best_p - sorted([p_a, p_draw, p_b])[-2]  # отрыв от второго по вероятности исхода
-        if gap > 0.30:
-            confidence = "высокая уверенность"
-        elif gap > 0.15:
-            confidence = "средняя уверенность"
-        else:
-            confidence = "низкая уверенность, матч равный"
-        who = best_team if best_team else "ничья"
-        lines.append(f"➡ Самое вероятное: {who} ({best_label}, {best_p*100:.1f}%) — {confidence}")
-
-        # Самый вероятный точный счёт (Пуассон)
-        lam_a, lam_b, _, _, top_scores = poisson_summary(team_a, team_b, attack, defense, league_avg)
-        top_i, top_j = top_scores[0][0]
-        lines.append(f"⚽ Вероятный счёт: {top_i}:{top_j} ({top_scores[0][1]*100:.1f}%)\n")
-
-    conn.close()
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    """ЧМ-2026 завершён (финал: Испания 1:0 Аргентина) — команда больше
+    не считает прогнозы, только направляет на /liga."""
+    await message.answer(
+        "⚽ Чемпионат мира 2026 завершён (финал: Испания 1:0 Аргентина) — "
+        "прогнозы по нему больше не считаются.\n\n"
+        "Сейчас бот работает по Ла Лиге — используй /liga."
+    )
 
 
 @dp.message(Command("liga"))
@@ -522,22 +445,9 @@ async def cmd_liga(message: Message):
     football-data.co.uk + дообновление сыгранными матчами текущего сезона
     из football.db. Модель пересобирается автоматически, когда в базе
     появляются новые завершённые матчи (после fetch_matches.py)."""
-    global laliga_model
-    current_finished = LaLigaModel.count_finished_pd(DB_PATH)
-    needs_rebuild = (
-        laliga_model is None
-        or laliga_model.db_finished_count != current_finished
-    )
-    if needs_rebuild:
-        try:
-            laliga_model = LaLigaModel(db_path=DB_PATH)
-        except FileNotFoundError as e:
-            await message.answer(
-                f"Не найдены файлы модели Ла Лиги ({e.filename}). "
-                f"Нужны laliga_matches_combined.csv и team_name_mapping.csv "
-                f"в папке с bot.py."
-            )
-            return
+    model = await ensure_laliga_model(message)
+    if model is None:
+        return
 
     conn = sqlite3.connect(DB_PATH)
     upcoming, when = find_upcoming_matches(conn, competition_code="PD")
@@ -578,16 +488,22 @@ async def cmd_liga(message: Message):
 @dp.message(Command("totals"))
 async def cmd_totals(message: Message):
     conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn)
-    upcoming, when = find_upcoming_matches(conn)
+    finished = load_finished_matches(conn, competition_code="PD")
+    upcoming, when = find_upcoming_matches(conn, competition_code="PD")
     conn.close()
 
     if not upcoming:
-        await message.answer("Не найдено предстоящих матчей.")
+        await message.answer("Не найдено предстоящих матчей Ла Лиги.")
         return
 
     attack, defense, league_avg = build_attack_defense(finished)
-    lines = [f"📊 Тоталы и обе забьют ({when} UTC):\n"]
+    lines = [f"📊 Тоталы и обе забьют, Ла Лига ({when} UTC):\n"]
+    if not finished:
+        lines.append(
+            "⚠ Сезон ещё не начался (нет сыгранных матчей в базе) — цифры ниже "
+            "усреднены по лиге, а не по конкретным командам. Точность вырастет "
+            "после первых туров.\n"
+        )
     for match_id, team_a, team_b in upcoming:
         lam_a, lam_b, over25, btts, top_scores = poisson_summary(team_a, team_b, attack, defense, league_avg)
         lines.append(f"<b>{team_a} — {team_b}</b>")
@@ -607,18 +523,23 @@ async def cmd_simulate(message: Message):
     вместо точного расчёта — для наглядности, что итог должен сходиться
     к тем же цифрам, что и /totals."""
     conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn)
-    upcoming, when = find_upcoming_matches(conn)
+    finished = load_finished_matches(conn, competition_code="PD")
+    upcoming, when = find_upcoming_matches(conn, competition_code="PD")
     conn.close()
 
     if not upcoming:
-        await message.answer("Не найдено предстоящих матчей.")
+        await message.answer("Не найдено предстоящих матчей Ла Лиги.")
         return
 
     attack, defense, league_avg = build_attack_defense(finished)
     n = 1000000
 
-    lines = [f"🎲 Симуляция {n} раз ({when} UTC):\n"]
+    lines = [f"🎲 Симуляция {n} раз, Ла Лига ({when} UTC):\n"]
+    if not finished:
+        lines.append(
+            "⚠ Сезон ещё не начался (нет сыгранных матчей в базе) — цифры ниже "
+            "усреднены по лиге, а не по конкретным командам.\n"
+        )
     for match_id, team_a, team_b in upcoming:
         att_a, def_a = attack.get(team_a, 1.0), defense.get(team_a, 1.0)
         att_b, def_b = attack.get(team_b, 1.0), defense.get(team_b, 1.0)
@@ -640,90 +561,105 @@ async def cmd_simulate(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+async def _resolve_match_pair(message: Message, tokens):
+    """Общая логика распознавания пары клубов для /match, /explain, /diff.
+    Возвращает (team_a, team_b) при успехе; при неоднозначности или
+    нераспознанном названии сама отвечает пользователю и возвращает None."""
+    conn = sqlite3.connect(DB_PATH)
+    known_names = get_known_pd_teams(conn)
+    conn.close()
+
+    team_a, team_b, amb_a, amb_b = parse_two_clubs(tokens, known_names)
+
+    if amb_a:
+        await message.answer(f"⚠ Уточни клуб: {' / '.join(amb_a)}\nПовтори запрос с более точным названием.")
+        return None
+    if amb_b:
+        await message.answer(f"⚠ Уточни клуб: {' / '.join(amb_b)}\nПовтори запрос с более точным названием.")
+        return None
+    if not team_a or not team_b:
+        await message.answer(
+            "⚠ Не смог распознать название клуба.\n"
+            "Проверь написание (например: Реал Мадрид, Барселона, Атлетико Мадрид...).\n"
+            "Список всех клубов — /ratings"
+        )
+        return None
+    return team_a, team_b
+
+
 @dp.message(Command("match"))
 async def cmd_match(message: Message):
     args = message.text.replace("/match", "").strip()
     tokens = [p.strip() for p in args.split(" ") if p.strip()]
     if len(tokens) < 2:
-        await message.answer("Использование: /match Команда1 Команда2\nНапример: /match France Spain")
-        return
-    team_a, team_b = parse_two_teams(tokens)
-
-    unrecognized = [n for n in (team_a, team_b) if not team_recognized(n)]
-    if unrecognized:
-        await message.answer(
-            f"⚠ Не распознал название: {', '.join(unrecognized)}\n"
-            "Проверь написание (например: Испания, Аргентина, Норвегия, Англия, France, Spain...).\n"
-            "Список всех команд — /ratings"
-        )
+        await message.answer("Использование: /match Клуб1 Клуб2\nНапример: /match Реал Мадрид Барселона")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn)
-    conn.close()
+    pair = await _resolve_match_pair(message, tokens)
+    if pair is None:
+        return
+    team_a, team_b = pair
 
-    elo, form, momentum = build_elo_form_momentum(finished)
-    p_a, p_draw, p_b, elo_a, elo_b = predict_elo(team_a, team_b, elo, form, momentum)
-    exp = explain_prediction(team_a, team_b, elo, form, momentum)
+    model = await ensure_laliga_model(message)
+    if model is None:
+        return
 
-    await message.answer(
-        f"<b>{team_a} — {team_b}</b>\n"
-        f"Elo: {elo_a:.0f} vs {elo_b:.0f}\n"
-        f"П1 {p_a*100:.1f}%  Х {p_draw*100:.1f}%  П2 {p_b*100:.1f}%\n"
-        f"<i>Как получилась цифра для {team_a}:</i>\n"
-        f"  База (только Elo): {exp['base_elo_pct']:.1f}%\n"
-        f"  {'+' if exp['form_contribution']>=0 else ''}{exp['form_contribution']:.1f}% форма\n"
-        f"  {'+' if exp['momentum_contribution']>=0 else ''}{exp['momentum_contribution']:.1f}% momentum\n"
-        f"  = Итог: {exp['final_pct']:.1f}%",
-        parse_mode="HTML",
-    )
+    result = model.predict(team_a, team_b)
+    p_a, p_draw, p_b = result["p_home"], result["p_draw"], result["p_away"]
+
+    lines = [
+        f"<b>{team_a} — {team_b}</b>",
+        f"Elo: {result['elo_home']:.0f} vs {result['elo_away']:.0f}",
+    ]
+    if not result["home_known"]:
+        lines.append(f"⚠ {team_a} — нет истории в базе (средний рейтинг лиги)")
+    if not result["away_known"]:
+        lines.append(f"⚠ {team_b} — нет истории в базе (средний рейтинг лиги)")
+    lines.append(f"П1 {p_a*100:.1f}%  Х {p_draw*100:.1f}%  П2 {p_b*100:.1f}%")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("explain"))
 async def cmd_explain(message: Message):
-    """Раскладывает прогноз на факторы: сколько добавляет Elo, сколько Form,
-    сколько Momentum. Использование: /explain Команда1 Команда2
+    """Раскладывает прогноз Ла Лиги на факторы: Elo и преимущество своего
+    поля. Использование: /explain Клуб1 Клуб2
 
-    (Та же разбивка, что уже показывается внутри /today и /match — эта
-    команда просто выводит её отдельно для любой пары по запросу.)"""
+    В модели Ла Лиги нет Form/Momentum (отключены как вредные по
+    ablation-тесту — см. laliga_grid_search.py), поэтому раскладка
+    ограничена двумя факторами, которые в модели реально есть."""
     args = message.text.replace("/explain", "").strip()
     tokens = [p.strip() for p in args.split(" ") if p.strip()]
     if len(tokens) < 2:
-        await message.answer("Использование: /explain Команда1 Команда2\nНапример: /explain Испания Аргентина")
-        return
-    team_a, team_b = parse_two_teams(tokens)
-
-    unrecognized = [n for n in (team_a, team_b) if not team_recognized(n)]
-    if unrecognized:
-        await message.answer(
-            f"⚠ Не распознал название: {', '.join(unrecognized)}\n"
-            "Список всех команд — /ratings"
-        )
+        await message.answer("Использование: /explain Клуб1 Клуб2\nНапример: /explain Реал Мадрид Барселона")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn)
-    conn.close()
+    pair = await _resolve_match_pair(message, tokens)
+    if pair is None:
+        return
+    team_a, team_b = pair
 
-    elo, form, momentum = build_elo_form_momentum(finished)
-    exp = explain_prediction(team_a, team_b, elo, form, momentum)
+    model = await ensure_laliga_model(message)
+    if model is None:
+        return
 
-    elo_a = elo.get(team_a, get_starting_elo(team_a))
-    elo_b = elo.get(team_b, get_starting_elo(team_b))
-    form_a, form_b = form.get(team_a, 0.0), form.get(team_b, 0.0)
-    mom_a, mom_b = momentum.get(team_a, 0.0), momentum.get(team_b, 0.0)
+    result = model.predict(team_a, team_b)
+    elo_a, elo_b = result["elo_home"], result["elo_away"]
 
-    def fmt_pp(value):
-        return f"{value:+.1f} п.п."
+    diff_elo_only = elo_a - elo_b
+    diff_with_home_adv = diff_elo_only + HOME_ADVANTAGE
+    p_home_base = predict_probs(diff_elo_only)[0]
+    p_home_final = predict_probs(diff_with_home_adv)[0]
+    home_adv_contribution = (p_home_final - p_home_base) * 100
 
     lines = [
         f"<b>Почему {team_a} — {team_b}?</b>\n",
-        f"База (только Elo {elo_a:.0f} vs {elo_b:.0f}): {exp['base_elo_pct']:.1f}%",
-        f"  Form ({form_a:+.2f} vs {form_b:+.2f}): {fmt_pp(exp['form_contribution'])}",
-        f"  Momentum ({mom_a:+.2f} vs {mom_b:+.2f}): {fmt_pp(exp['momentum_contribution'])}",
-        f"\nИтоговая вероятность победы {team_a}: <b>{exp['final_pct']:.1f}%</b>",
-        "\n<i>Разбивка приближённая (порядок факторов важен), но показывает,"
-        " какой фактор сдвигает прогноз сильнее всего.</i>",
+        f"База (только Elo {elo_a:.0f} vs {elo_b:.0f}): {p_home_base*100:.1f}%",
+        f"  Своё поле (+{HOME_ADVANTAGE} к Elo хозяев): {home_adv_contribution:+.1f} п.п.",
+        f"\nИтоговая вероятность победы {team_a}: <b>{p_home_final*100:.1f}%</b>",
+        "\n<i>В модели Ла Лиги нет Form/Momentum — они отключены как вредные "
+        "по результатам ablation-теста, поэтому раскладка ограничена Elo и "
+        "преимуществом своего поля.</i>",
     ]
 
     await message.answer("\n".join(lines), parse_mode="HTML")
@@ -731,14 +667,13 @@ async def cmd_explain(message: Message):
 
 @dp.message(Command("ratings"))
 async def cmd_ratings(message: Message):
-    conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn)
-    conn.close()
+    model = await ensure_laliga_model(message)
+    if model is None:
+        return
 
-    elo, form, momentum = build_elo_form_momentum(finished)
-    top = sorted(elo.items(), key=lambda kv: kv[1], reverse=True)[:15]
+    top = sorted(model.elo.items(), key=lambda kv: kv[1], reverse=True)[:15]
 
-    lines = ["🏆 Топ-15 команд по текущему рейтингу:\n"]
+    lines = ["🏆 Топ-15 клубов Ла Лиги по текущему рейтингу:\n"]
     for i, (team, rating) in enumerate(top, 1):
         lines.append(f"{i}. {team} — {rating:.0f}")
 
@@ -858,13 +793,13 @@ async def cmd_accuracy(message: Message):
 
 @dp.message(Command("diff"))
 async def cmd_diff(message: Message):
-    """Использование: /diff Norway England 4.05 3.70 1.93
-    (команда1 команда2 кэф_П1 кэф_Х кэф_П2 — коэффициенты на основное время)"""
+    """Использование: /diff Реал Мадрид Барселона 2.10 3.40 3.20
+    (клуб1 клуб2 кэф_П1 кэф_Х кэф_П2 — коэффициенты на основное время)"""
     args = message.text.replace("/diff", "").strip().split()
     if len(args) < 5:
         await message.answer(
-            "Использование: /diff Команда1 Команда2 кэф_П1 кэф_Х кэф_П2\n"
-            "Например: /diff Norway England 4.05 3.70 1.93"
+            "Использование: /diff Клуб1 Клуб2 кэф_П1 кэф_Х кэф_П2\n"
+            "Например: /diff Реал Мадрид Барселона 2.10 3.40 3.20"
         )
         return
 
@@ -875,33 +810,29 @@ async def cmd_diff(message: Message):
         except ValueError:
             return False
 
-    # Последние 3 токена — коэффициенты, всё, что до них — названия команд
-    # (могут быть многословными, например "Кабо Верде")
+    # Последние 3 токена — коэффициенты, всё, что до них — названия клубов
+    # (могут быть многословными, например "Реал Сосьедад")
     if not all(is_float(x) for x in args[-3:]) or len(args) < 5:
         await message.answer(
-            "Использование: /diff Команда1 Команда2 кэф_П1 кэф_Х кэф_П2\n"
-            "Например: /diff Norway England 4.05 3.70 1.93"
+            "Использование: /diff Клуб1 Клуб2 кэф_П1 кэф_Х кэф_П2\n"
+            "Например: /diff Реал Мадрид Барселона 2.10 3.40 3.20"
         )
         return
 
     name_tokens = args[:-3]
     odds_home, odds_draw, odds_away = (float(x) for x in args[-3:])
-    team_a, team_b = parse_two_teams(name_tokens)
 
-    unrecognized = [n for n in (team_a, team_b) if not team_recognized(n)]
-    if unrecognized:
-        await message.answer(
-            f"⚠ Не распознал название: {', '.join(unrecognized)}\n"
-            "Проверь написание. Список команд — /ratings"
-        )
+    pair = await _resolve_match_pair(message, name_tokens)
+    if pair is None:
+        return
+    team_a, team_b = pair
+
+    model = await ensure_laliga_model(message)
+    if model is None:
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn)
-    conn.close()
-
-    elo, form, momentum = build_elo_form_momentum(finished)
-    p_model_a, p_model_draw, p_model_b, elo_a, elo_b = predict_elo(team_a, team_b, elo, form, momentum)
+    result = model.predict(team_a, team_b)
+    p_model_a, p_model_draw, p_model_b = result["p_home"], result["p_draw"], result["p_away"]
 
     raw = {"home": 1 / odds_home, "draw": 1 / odds_draw, "away": 1 / odds_away}
     total = sum(raw.values())
@@ -1249,15 +1180,15 @@ async def cmd_admin_grant(message: Message):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "⚽ Football Prediction Lab\n\n"
-        "/today — прогноз на ближайшие матчи\n"
+        "⚽ Football Prediction Lab — Ла Лига\n\n"
+        "/liga — прогноз на ближайшие матчи\n"
         "/totals — тоталы и обе забьют (+ вероятные счета)\n"
-        "/simulate — разыграть ближайшие матчи 100 000 раз (Монте-Карло)\n"
-        "/match Команда1 Команда2 — прогноз вручную\n"
-        "/explain Команда1 Команда2 — разбивка прогноза на факторы (Elo/Form/Momentum)\n"
-        "/ratings — топ команд по рейтингу\n"
-        "/accuracy — история прогнозов: точность модели, калибровка, где чаще ошибается\n"
-        "/diff Команда1 Команда2 П1 Х П2 — сравнить с коэффициентами букмекера\n"
+        "/simulate — разыграть ближайшие матчи 1 000 000 раз (Монте-Карло)\n"
+        "/match Клуб1 Клуб2 — прогноз на конкретную пару вручную\n"
+        "/explain Клуб1 Клуб2 — разбивка прогноза на факторы (Elo/своё поле)\n"
+        "/ratings — топ клубов по рейтингу\n"
+        "/accuracy — история прогнозов ЧМ-2026 (архив, для Ла Лиги пока не ведётся)\n"
+        "/diff Клуб1 Клуб2 П1 Х П2 — сравнить с коэффициентами букмекера\n"
         "/arbitrage [Имя] П1 Х П2 [Имя] П1 Х П2 ... [stake=] [round=] — поиск вилки (3 исхода)\n"
         "/arbitrage2 [Имя] исход1 исход2 ... [stake=] [round=] — вилка для тотала/обе забьют (2 исхода)"
     )
@@ -1301,14 +1232,13 @@ async def set_commands(bot: Bot):
     админам (ADMIN_IDS) — ещё и админские.
     """
     default_commands = [
-        BotCommand(command="today", description="Прогноз на ближайшие матчи (ЧМ)"),
         BotCommand(command="liga", description="Прогноз на ближайшие матчи Ла Лиги"),
         BotCommand(command="totals", description="Тоталы и обе забьют"),
         BotCommand(command="simulate", description="Монте-Карло симуляция матча"),
-        BotCommand(command="match", description="Прогноз на конкретную пару вручную"),
+        BotCommand(command="match", description="Прогноз на конкретную пару клубов вручную"),
         BotCommand(command="explain", description="Разбивка прогноза на факторы"),
-        BotCommand(command="ratings", description="Топ команд по рейтингу"),
-        BotCommand(command="accuracy", description="Точность прошлых прогнозов"),
+        BotCommand(command="ratings", description="Топ клубов по рейтингу"),
+        BotCommand(command="accuracy", description="Точность прошлых прогнозов (архив ЧМ)"),
         BotCommand(command="diff", description="Сравнить с коэффициентами букмекера"),
         BotCommand(command="arbitrage", description="Поиск вилки (3 исхода)"),
         BotCommand(command="arbitrage2", description="Поиск вилки (2 исхода)"),
