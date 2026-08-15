@@ -1,6 +1,7 @@
 .env
 football.db
 football_backup_*.db
+dc_params.json
 __pycache__/
 *.pyc
 .venv/

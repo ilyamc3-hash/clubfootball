@@ -35,6 +35,21 @@ HOME_ADVANTAGE = 60
 SEASON_REGRESSION = 0.20
 
 
+def load_team_mapping(mapping_path):
+    """org (football-data.org) -> couk (football-data.co.uk) имя.
+    Общая для LaLigaModel и DixonColesModel - чтобы не парсить
+    team_name_mapping.csv в двух местах."""
+    mapping = {}
+    with open(mapping_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            org_name = r.get("football_data_org", "").strip()
+            couk_name = r.get("football_data_co_uk", "").strip()
+            if org_name and couk_name and "ИЛИ" not in org_name:
+                mapping[org_name] = couk_name
+    return mapping
+
+
 def mov_multiplier(goal_diff, elo_diff_pre_match):
     goal_diff = abs(goal_diff)
     if goal_diff == 0:
@@ -91,16 +106,7 @@ class LaLigaModel:
     # ---------- загрузка ----------
 
     def _load_mapping(self):
-        """org (football-data.org) -> couk (football-data.co.uk) имя."""
-        mapping = {}
-        with open(self.mapping_path, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                org_name = r.get("football_data_org", "").strip()
-                couk_name = r.get("football_data_co_uk", "").strip()
-                if org_name and couk_name and "ИЛИ" not in org_name:
-                    mapping[org_name] = couk_name
-        return mapping
+        return load_team_mapping(self.mapping_path)
 
     def _load_history(self):
         rows = []

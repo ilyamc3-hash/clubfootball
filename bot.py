@@ -41,8 +41,10 @@ from aiogram import Bot, Dispatcher, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from laliga_model import LaLigaModel, HOME_ADVANTAGE, predict_probs
+from dixon_coles_model import DixonColesModel
 
 laliga_model = None  # строится лениво при первом обращении к клубным командам, чтобы не тормозить старт бота
+dc_model = None  # Dixon-Coles для /totals — строится лениво, читает dc_params.json (не фитит сама)
 
 # Русские алиасы клубов Ла Лиги -> имя, как оно хранится в football.db
 # (приходит из football-data.org). Намеренно НЕ включает короткие
@@ -176,6 +178,31 @@ async def ensure_laliga_model(message: Message):
             )
             return None
     return laliga_model
+
+
+async def ensure_dc_model(message: Message):
+    """Обеспечивает актуальную DixonColesModel для /totals. dc_params.json
+    пересчитывается ОТДЕЛЬНЫМ скриптом (refit_dixon_coles.py, по cron) —
+    здесь только читаем файл и перечитываем, если он обновился с прошлого
+    раза (по mtime). Если файла ещё нет (до первого refit) — понятная
+    ошибка пользователю, без падения."""
+    global dc_model
+    params_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dc_params.json")
+    if not os.path.exists(params_path):
+        await message.answer(
+            "Модель тоталов (Dixon-Coles) ещё не посчитана — не найден dc_params.json. "
+            "Нужно один раз запустить refit_dixon_coles.py на сервере."
+        )
+        return None
+
+    needs_rebuild = dc_model is None or dc_model.params_mtime != os.path.getmtime(params_path)
+    if needs_rebuild:
+        try:
+            dc_model = DixonColesModel()
+        except (FileNotFoundError, ValueError, KeyError) as e:
+            await message.answer(f"Не удалось загрузить модель тоталов (Dixon-Coles): {e}")
+            return None
+    return dc_model
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -487,8 +514,17 @@ async def cmd_liga(message: Message):
 
 @dp.message(Command("totals"))
 async def cmd_totals(message: Message):
+    """Тоталы и "обе забьют" по ближайшим матчам Ла Лиги — на Dixon-Coles
+    (dixon_coles_model.py: раздельные атака/защита по команде, честный
+    бэктест против рынка тоталов дал Brier 0.2418 vs рынок 0.2374, разрыв
+    +0.0044 — против грубой Пуассон-калибровки только по текущему сезону,
+    которая была тут раньше). Модель фитится ОТДЕЛЬНЫМ скриптом по cron
+    (refit_dixon_coles.py), тут только чтение готовых параметров."""
+    model = await ensure_dc_model(message)
+    if model is None:
+        return
+
     conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn, competition_code="PD")
     upcoming, when = find_upcoming_matches(conn, competition_code="PD")
     conn.close()
 
@@ -496,21 +532,18 @@ async def cmd_totals(message: Message):
         await message.answer("Не найдено предстоящих матчей Ла Лиги.")
         return
 
-    attack, defense, league_avg = build_attack_defense(finished)
     lines = [f"📊 Тоталы и обе забьют, Ла Лига ({when} UTC):\n"]
-    if not finished:
-        lines.append(
-            "⚠ Сезон ещё не начался (нет сыгранных матчей в базе) — цифры ниже "
-            "усреднены по лиге, а не по конкретным командам. Точность вырастет "
-            "после первых туров.\n"
-        )
     for match_id, team_a, team_b in upcoming:
-        lam_a, lam_b, over25, btts, top_scores = poisson_summary(team_a, team_b, attack, defense, league_avg)
+        result = model.predict_totals(team_a, team_b)
         lines.append(f"<b>{team_a} — {team_b}</b>")
-        lines.append(f"Ож. голы: {lam_a:.2f} — {lam_b:.2f}")
-        lines.append(f"Тотал больше 2.5: {over25*100:.1f}%   Обе забьют: {btts*100:.1f}%")
+        if not result["home_known"]:
+            lines.append(f"⚠ {team_a} — нет истории в модели тоталов (средний уровень лиги)")
+        if not result["away_known"]:
+            lines.append(f"⚠ {team_b} — нет истории в модели тоталов (средний уровень лиги)")
+        lines.append(f"Ож. голы: {result['lambda_home']:.2f} — {result['lambda_away']:.2f}")
+        lines.append(f"Тотал больше 2.5: {result['p_over']*100:.1f}%   Обе забьют: {result['p_btts']*100:.1f}%")
         lines.append("Самые вероятные счета:")
-        for (i, j), p in top_scores:
+        for (i, j), p in result["top_scores"]:
             lines.append(f"  {i}:{j} — {p*100:.1f}%")
         lines.append("")
 
