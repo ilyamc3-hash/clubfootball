@@ -173,8 +173,14 @@ def fit_dixon_coles(matches_subset, as_of_date, xi, team_index, n_teams):
     """MLE-фит параметров атаки/защиты на подвыборке матчей (строго до
     as_of_date), с весом exp(-xi * дней_с_матча) - более свежие матчи
     получают больший вес. Первая команда (team_index[...]==0) - референс,
-    attack=defense=0, не оптимизируется."""
-    n = len(matches_subset)
+    attack=defense=0, не оптимизируется.
+
+    ПРОИЗВОДИТЕЛЬНОСТЬ: функция возвращает (NLL, градиент) аналитически
+    (jac=True), а не полагается на численный градиент scipy - для ~62
+    параметров численный градиент означал бы ~65x лишних вызовов функции
+    на каждый шаг оптимизации. Также lgamma(k+1) считается ОДИН РАЗ до
+    оптимизации (это константа, не зависящая от параметров - раньше
+    пересчитывалась на каждый вызов, что было чистой тратой времени)."""
     home_idx = np.array([team_index[m["home"]] for m in matches_subset])
     away_idx = np.array([team_index[m["away"]] for m in matches_subset])
     hg = np.array([m["hg"] for m in matches_subset], dtype=float)
@@ -182,19 +188,27 @@ def fit_dixon_coles(matches_subset, as_of_date, xi, team_index, n_teams):
     days_ago = np.array([(as_of_date - m["date"]).days for m in matches_subset], dtype=float)
     weights = np.exp(-xi * days_ago)
 
+    # константы, не зависящие от параметров - считаем один раз
+    from scipy.special import gammaln
+    lgamma_hg1 = gammaln(hg + 1)
+    lgamma_ag1 = gammaln(ag + 1)
+
+    mask00 = (hg == 0) & (ag == 0)
+    mask01 = (hg == 0) & (ag == 1)
+    mask10 = (hg == 1) & (ag == 0)
+    mask11 = (hg == 1) & (ag == 1)
+
     n_free = n_teams - 1  # первая команда - референс
 
     def unpack(theta):
         mu = theta[0]
         home_adv = theta[1]
         rho = theta[2]
-        attack_free = theta[3:3 + n_free]
-        defense_free = theta[3 + n_free:3 + 2 * n_free]
-        attack = np.concatenate(([0.0], attack_free))
-        defense = np.concatenate(([0.0], defense_free))
+        attack = np.concatenate(([0.0], theta[3:3 + n_free]))
+        defense = np.concatenate(([0.0], theta[3 + n_free:3 + 2 * n_free]))
         return mu, home_adv, rho, attack, defense
 
-    def neg_log_likelihood(theta):
+    def nll_and_grad(theta):
         mu, home_adv, rho, attack, defense = unpack(theta)
         log_lam_home = mu + home_adv + attack[home_idx] - defense[away_idx]
         log_lam_away = mu + attack[away_idx] - defense[home_idx]
@@ -203,19 +217,52 @@ def fit_dixon_coles(matches_subset, as_of_date, xi, team_index, n_teams):
         lam_home = np.exp(log_lam_home)
         lam_away = np.exp(log_lam_away)
 
-        # log Poisson pmf: k*log(lam) - lam - lgamma(k+1)
-        log_p_home = hg * np.log(lam_home) - lam_home - np.array([math.lgamma(k + 1) for k in hg])
-        log_p_away = ag * np.log(lam_away) - lam_away - np.array([math.lgamma(k + 1) for k in ag])
-        log_p = log_p_home + log_p_away
+        log_p = (hg * log_lam_home - lam_home - lgamma_hg1
+                 + ag * log_lam_away - lam_away - lgamma_ag1)
 
-        tau = np.array([
-            tau_correction(int(h), int(a), lh, la, rho)
-            for h, a, lh, la in zip(hg, ag, lam_home, lam_away)
-        ])
-        tau = np.clip(tau, 1e-6, None)  # защита от log(0) при экстремальном rho
-        log_p_total = log_p + np.log(tau)
+        tau = np.ones_like(lam_home)
+        tau[mask00] = 1 - lam_home[mask00] * lam_away[mask00] * rho
+        tau[mask01] = 1 + lam_home[mask01] * rho
+        tau[mask10] = 1 + lam_away[mask10] * rho
+        tau[mask11] = 1 - rho
+        tau_safe = np.clip(tau, 1e-6, None)
+        nll = -np.sum(weights * (log_p + np.log(tau_safe)))
 
-        return -np.sum(weights * log_p_total)
+        # --- аналитический градиент ---
+        dlogtau_dLh = np.zeros_like(lam_home)
+        dlogtau_dLa = np.zeros_like(lam_home)
+        dlogtau_drho = np.zeros_like(lam_home)
+
+        dlogtau_dLh[mask00] = -lam_away[mask00] * rho * lam_home[mask00] / tau_safe[mask00]
+        dlogtau_dLa[mask00] = -lam_home[mask00] * rho * lam_away[mask00] / tau_safe[mask00]
+        dlogtau_drho[mask00] = -lam_home[mask00] * lam_away[mask00] / tau_safe[mask00]
+
+        dlogtau_dLh[mask01] = rho * lam_home[mask01] / tau_safe[mask01]
+        dlogtau_drho[mask01] = lam_home[mask01] / tau_safe[mask01]
+
+        dlogtau_dLa[mask10] = rho * lam_away[mask10] / tau_safe[mask10]
+        dlogtau_drho[mask10] = lam_away[mask10] / tau_safe[mask10]
+
+        dlogtau_drho[mask11] = -1.0 / tau_safe[mask11]
+
+        grad_Lh = -weights * ((hg - lam_home) + dlogtau_dLh)
+        grad_La = -weights * ((ag - lam_away) + dlogtau_dLa)
+        grad_rho = -weights * dlogtau_drho
+
+        d_mu = np.sum(grad_Lh) + np.sum(grad_La)
+        d_home_adv = np.sum(grad_Lh)
+        d_rho = np.sum(grad_rho)
+
+        attack_grad_full = (np.bincount(home_idx, weights=grad_Lh, minlength=n_teams)
+                             + np.bincount(away_idx, weights=grad_La, minlength=n_teams))
+        defense_grad_full = (np.bincount(away_idx, weights=-grad_Lh, minlength=n_teams)
+                              + np.bincount(home_idx, weights=-grad_La, minlength=n_teams))
+
+        grad_theta = np.concatenate((
+            [d_mu, d_home_adv, d_rho],
+            attack_grad_full[1:], defense_grad_full[1:],
+        ))
+        return nll, grad_theta
 
     x0 = np.zeros(3 + 2 * n_free)
     x0[0] = math.log(LEAGUE_AVG_GOALS)  # разумный старт для mu
@@ -227,8 +274,8 @@ def fit_dixon_coles(matches_subset, as_of_date, xi, team_index, n_teams):
         + [PARAM_BOUNDS_ATTACK_DEFENSE] * (2 * n_free)
     )
 
-    result = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds,
-                       options={"maxiter": 300})
+    result = minimize(nll_and_grad, x0, method="L-BFGS-B", jac=True, bounds=bounds,
+                       options={"maxiter": 150})
 
     mu, home_adv, rho, attack, defense = unpack(result.x)
     return {"mu": mu, "home_adv": home_adv, "rho": rho, "attack": attack, "defense": defense}

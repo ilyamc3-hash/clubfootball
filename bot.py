@@ -42,6 +42,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from laliga_model import LaLigaModel, HOME_ADVANTAGE, predict_probs
 from dixon_coles_model import DixonColesModel
+import accuracy_store  # трекинг точности Ла Лиги (/accuracy_liga)
 
 laliga_model = None  # строится лениво при первом обращении к клубным командам, чтобы не тормозить старт бота
 dc_model = None  # Dixon-Coles для /totals — строится лениво, читает dc_params.json (не фитит сама)
@@ -328,7 +329,44 @@ def simulate_match(lambda_a, lambda_b, n):
     return wins_a, draws, wins_b, score_counter
 
 
-MODEL_VERSION = "v0.3-elo-form-momentum-fifa"
+MODEL_VERSION = "v0.3-elo-form-momentum-fifa"  # архив ЧМ — не менять
+
+# Версии моделей Ла Лиги для трекинга точности (/accuracy_liga).
+# Менять при любом изменении модели, чтобы статистику можно было
+# разрезать по версиям и не смешивать несравнимое.
+LIGA_1X2_MODEL_VERSION = "laliga-v1.0-elo-ha60-regr020-mov"
+LIGA_TOTALS_MODEL_VERSION = "laliga-totals-v1.0-dixon-coles"
+
+
+def log_liga_prediction_1x2(conn, match_id, team_a, team_b, result):
+    """Тихо сохраняет прогноз 1X2 для /accuracy_liga. Ошибка сохранения
+    никогда не должна ломать ответ пользователю."""
+    try:
+        accuracy_store.ensure_accuracy_tables(conn)
+        accuracy_store.save_prediction_1x2(
+            conn, match_id, team_a, team_b,
+            result["p_home"], result["p_draw"], result["p_away"],
+            LIGA_1X2_MODEL_VERSION,
+            is_fallback=not (result["home_known"] and result["away_known"]),
+        )
+    except Exception as e:
+        logging.warning("accuracy_liga: не сохранился прогноз 1X2 (%s—%s): %s",
+                        team_a, team_b, e)
+
+
+def log_liga_prediction_totals(conn, match_id, team_a, team_b, result):
+    try:
+        accuracy_store.ensure_accuracy_tables(conn)
+        accuracy_store.save_prediction_totals(
+            conn, match_id, team_a, team_b,
+            result["lambda_home"], result["lambda_away"],
+            result["p_over"], result["p_btts"],
+            LIGA_TOTALS_MODEL_VERSION,
+            is_fallback=not (result["home_known"] and result["away_known"]),
+        )
+    except Exception as e:
+        logging.warning("accuracy_liga: не сохранился прогноз тоталов (%s—%s): %s",
+                        team_a, team_b, e)
 
 
 def ensure_predictions_table(conn):
@@ -485,8 +523,10 @@ async def cmd_liga(message: Message):
         return
 
     lines = [f"⚽ Ближайшие матчи Ла Лиги ({when} UTC):\n"]
+    log_conn = sqlite3.connect(DB_PATH)  # для записи прогнозов в /accuracy_liga
     for match_id, team_a, team_b in upcoming:
         result = laliga_model.predict(team_a, team_b)
+        log_liga_prediction_1x2(log_conn, match_id, team_a, team_b, result)
         p_a, p_draw, p_b = result["p_home"], result["p_draw"], result["p_away"]
 
         lines.append(f"<b>{team_a} — {team_b}</b>")
@@ -509,6 +549,7 @@ async def cmd_liga(message: Message):
         who = best_team if best_team else "ничья"
         lines.append(f"➡ Самое вероятное: {who} ({best_label}, {best_p*100:.1f}%) — {confidence}\n")
 
+    log_conn.close()
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -533,8 +574,10 @@ async def cmd_totals(message: Message):
         return
 
     lines = [f"📊 Тоталы и обе забьют, Ла Лига ({when} UTC):\n"]
+    log_conn = sqlite3.connect(DB_PATH)  # для записи прогнозов в /accuracy_liga
     for match_id, team_a, team_b in upcoming:
         result = model.predict_totals(team_a, team_b)
+        log_liga_prediction_totals(log_conn, match_id, team_a, team_b, result)
         lines.append(f"<b>{team_a} — {team_b}</b>")
         if not result["home_known"]:
             lines.append(f"⚠ {team_a} — нет истории в модели тоталов (средний уровень лиги)")
@@ -547,6 +590,7 @@ async def cmd_totals(message: Message):
             lines.append(f"  {i}:{j} — {p*100:.1f}%")
         lines.append("")
 
+    log_conn.close()
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -727,6 +771,7 @@ async def cmd_accuracy(message: Message):
         FROM predictions p
         JOIN matches m ON p.match_id = m.id
         WHERE p.actual_result IS NOT NULL
+          AND p.competition_code = 'WC'  -- замороженный архив ЧМ; Ла Лига — в /accuracy_liga
     """).fetchall()
     conn.close()
 
@@ -822,6 +867,73 @@ async def cmd_accuracy(message: Message):
             lines.append(f"  {team}: {errs} ошибок из {total} прогнозов")
 
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("accuracy_liga"))
+async def cmd_accuracy_liga(message: Message):
+    """Точность прогнозов Ла Лиги: 1X2 (Elo) и тоталы (Dixon-Coles) раздельно.
+    Сравнение с рынком — парное, только по матчам с захваченными кэфами
+    (fetch_fixture_odds.py), по той же методологии, что OOS-бэктест
+    (AvgH/AvgD/AvgA + пропорциональная нормализация маржи)."""
+    conn = sqlite3.connect(DB_PATH)
+    accuracy_store.ensure_accuracy_tables(conn)
+    just_1x2 = reconcile_predictions(conn)
+    just_totals = accuracy_store.reconcile_totals(conn)
+    stats = accuracy_store.accuracy_liga_stats(conn)
+    conn.close()
+
+    if not stats["n_1x2"] and not stats["n_totals"]:
+        await message.answer(
+            "По Ла Лиге пока нет сверенных прогнозов. Прогнозы сохраняются "
+            "автоматически (фоновая задача + при каждом /liga и /totals), "
+            "а сверяются после завершения матчей."
+        )
+        return
+
+    lines = ["📊 Точность модели, Ла Лига"]
+    if just_1x2 or just_totals:
+        lines[0] += f" (+{just_1x2 + just_totals} только что сверено)"
+    lines.append("")
+
+    if stats["n_1x2"]:
+        lines.append(f"<b>Исходы 1X2 (Elo)</b> — {stats['n_1x2']} матчей:")
+        lines.append(f"  Accuracy: {stats['accuracy']*100:.1f}%")
+        lines.append(f"  Brier модели: {stats['brier_1x2']:.4f}")
+        if stats.get("market_n"):
+            lines.append(
+                f"  Рынок ({stats['market_n']} матчей с кэфами): "
+                f"Brier {stats['market_brier_1x2']:.4f}, "
+                f"разрыв {stats['gap_1x2']:+.4f} "
+                f"(OOS-бэктест: +0.0042)"
+            )
+        else:
+            lines.append("  Кэфы рынка ещё не захвачены (fetch_fixture_odds.py)")
+        if stats.get("fallback_n"):
+            lines.append(
+                f"  ⚠ Матчи с новичками без истории: {stats['fallback_n']} шт, "
+                f"Brier {stats['fallback_brier_1x2']:.4f}"
+            )
+        lines.append("")
+
+    if stats["n_totals"]:
+        lines.append(f"<b>Тоталы (Dixon-Coles)</b> — {stats['n_totals']} матчей:")
+        lines.append(f"  Тб2.5 accuracy: {stats['accuracy_over25']*100:.1f}%, "
+                     f"Brier {stats['brier_over25']:.4f}")
+        lines.append(f"  Обе забьют: Brier {stats['brier_btts']:.4f} (рынка BTTS нет в источнике)")
+        if stats.get("market_n_totals"):
+            lines.append(
+                f"  Рынок Тб2.5 ({stats['market_n_totals']} матчей): "
+                f"Brier {stats['market_brier_over25']:.4f}, "
+                f"разрыв {stats['gap_over25']:+.4f}"
+            )
+
+    n_min = max(stats["n_1x2"], stats["n_totals"])
+    if n_min < 50:
+        lines.append("")
+        lines.append(f"⚠ Выборка мала ({n_min} матчей) — разрыв с рынком "
+                     f"статистически осмыслен ближе к ~100+ матчам.")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("diff"))
@@ -1258,6 +1370,58 @@ async def periodic_fetch_matches():
         await asyncio.sleep(FETCH_INTERVAL_SECONDS)
 
 
+async def periodic_accuracy_liga():
+    """
+    Фоновая задача: раз в час сохраняет прогнозы на предстоящие матчи
+    Ла Лиги и сверяет завершённые — независимо от того, вызывал ли кто-то
+    /liga. Без этого статистика /accuracy_liga получала бы смещение выборки
+    (логировались бы только туры, когда ботом пользовались).
+    Первый прогон — через 5 минут после старта, чтобы дать
+    periodic_fetch_matches обновить базу.
+    """
+    await asyncio.sleep(300)
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            accuracy_store.ensure_accuracy_tables(conn)
+
+            reconcile_predictions(conn)
+            accuracy_store.reconcile_totals(conn)
+
+            upcoming, _ = find_upcoming_matches(conn, competition_code="PD")
+            if upcoming:
+                try:
+                    model_1x2 = LaLigaModel(db_path=DB_PATH)
+                except FileNotFoundError as e:
+                    model_1x2 = None
+                    logging.warning("accuracy_liga(фон): нет файлов Elo-модели: %s", e)
+                dc_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "dc_params.json")
+                model_dc = None
+                if os.path.exists(dc_path):
+                    try:
+                        model_dc = DixonColesModel()
+                    except (FileNotFoundError, ValueError, KeyError) as e:
+                        logging.warning("accuracy_liga(фон): Dixon-Coles не загрузился: %s", e)
+
+                for match_id, team_a, team_b in upcoming:
+                    if model_1x2 is not None:
+                        log_liga_prediction_1x2(
+                            conn, match_id, team_a, team_b,
+                            model_1x2.predict(team_a, team_b))
+                    if model_dc is not None:
+                        log_liga_prediction_totals(
+                            conn, match_id, team_a, team_b,
+                            model_dc.predict_totals(team_a, team_b))
+                logging.info("accuracy_liga(фон): обработано %d предстоящих матчей",
+                             len(upcoming))
+            conn.close()
+        except Exception as e:
+            logging.error("accuracy_liga(фон): ошибка цикла: %s", e)
+
+        await asyncio.sleep(3600)
+
+
 async def set_commands(bot: Bot):
     """
     Настраивает всплывающее меню команд в Telegram (появляется при вводе "/").
@@ -1271,6 +1435,7 @@ async def set_commands(bot: Bot):
         BotCommand(command="match", description="Прогноз на конкретную пару клубов вручную"),
         BotCommand(command="explain", description="Разбивка прогноза на факторы"),
         BotCommand(command="ratings", description="Топ клубов по рейтингу"),
+        BotCommand(command="accuracy_liga", description="Точность прогнозов Ла Лиги"),
         BotCommand(command="accuracy", description="Точность прошлых прогнозов (архив ЧМ)"),
         BotCommand(command="diff", description="Сравнить с коэффициентами букмекера"),
         BotCommand(command="arbitrage", description="Поиск вилки (3 исхода)"),
@@ -1299,6 +1464,7 @@ async def main():
     dp.message.middleware(UserTrackingMiddleware())
     await set_commands(bot)
     asyncio.create_task(periodic_fetch_matches())
+    asyncio.create_task(periodic_accuracy_liga())
     await dp.start_polling(bot)
 
 
