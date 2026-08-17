@@ -14,6 +14,7 @@ season/matchday (нужно для регрессии между сезонам�
 
 import os
 import sqlite3
+import sys
 import requests
 from datetime import datetime
 
@@ -151,6 +152,12 @@ def fetch_matches(competition_code, status=None):
 
 
 def main():
+    # На Windows консоль часто в cp1251, которая не может закодировать
+    # диакритику в именах команд (Beñat, José и т.п.) - без этого
+    # print() валит скрипт с UnicodeEncodeError уже ПОСЛЕ того, как
+    # данные записаны в базу.
+    sys.stdout.reconfigure(encoding="utf-8")
+
     conn = sqlite3.connect(DB_PATH)
     create_tables(conn)
 
