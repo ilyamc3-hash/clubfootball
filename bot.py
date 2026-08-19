@@ -221,19 +221,6 @@ dp = Dispatcher()
 
 # ---------- Общая логика (та же, что в compute_ratings.py / predict_match.py) ----------
 
-def load_finished_matches(conn, competition_code="WC"):
-    cur = conn.execute("""
-        SELECT m.utc_date, t1.name, t2.name, m.regular_home, m.regular_away
-        FROM matches m
-        JOIN teams t1 ON m.home_team_id = t1.id
-        JOIN teams t2 ON m.away_team_id = t2.id
-        WHERE m.status = 'FINISHED' AND m.regular_home IS NOT NULL
-          AND m.competition_code = ?
-        ORDER BY m.utc_date ASC
-    """, (competition_code,))
-    return cur.fetchall()
-
-
 def find_upcoming_matches(conn, competition_code="WC"):
     cur = conn.execute("""
         SELECT m.id, m.utc_date, t1.name, t2.name
@@ -256,47 +243,6 @@ def find_upcoming_matches(conn, competition_code="WC"):
         if (dt - earliest).total_seconds() <= 20 * 3600:
             window.append((match_id, h, a))
     return window, rows[0][1][:16]
-
-
-def poisson_pmf(k, lam):
-    return (lam ** k) * math.exp(-lam) / math.factorial(k)
-
-
-def build_attack_defense(matches):
-    gf, ga, games = {}, {}, {}
-    total_goals, total_games = 0, 0
-    for _, home, away, hg, ag in matches:
-        for team, s, c in [(home, hg, ag), (away, ag, hg)]:
-            gf[team] = gf.get(team, 0) + s
-            ga[team] = ga.get(team, 0) + c
-            games[team] = games.get(team, 0) + 1
-        total_goals += hg + ag
-        total_games += 2
-    league_avg = total_goals / total_games if total_games else 1.4
-    attack = {t: (gf[t] / games[t]) / league_avg for t in games}
-    defense = {t: (ga[t] / games[t]) / league_avg for t in games}
-    return attack, defense, league_avg
-
-
-def poisson_summary(team_a, team_b, attack, defense, league_avg):
-    att_a, def_a = attack.get(team_a, 1.0), defense.get(team_a, 1.0)
-    att_b, def_b = attack.get(team_b, 1.0), defense.get(team_b, 1.0)
-    lam_a = att_a * def_b * league_avg
-    lam_b = att_b * def_a * league_avg
-
-    over25, btts_yes = 0.0, 0.0
-    score_probs = {}
-    for i in range(MAX_GOALS + 1):
-        for j in range(MAX_GOALS + 1):
-            p = poisson_pmf(i, lam_a) * poisson_pmf(j, lam_b)
-            score_probs[(i, j)] = p
-            if i + j >= 3:
-                over25 += p
-            if i >= 1 and j >= 1:
-                btts_yes += p
-
-    top_scores = sorted(score_probs.items(), key=lambda kv: kv[1], reverse=True)[:5]
-    return lam_a, lam_b, over25, btts_yes, top_scores
 
 
 def sample_poisson(lam):
@@ -385,20 +331,6 @@ def ensure_predictions_table(conn):
             was_correct INTEGER
         )
     """)
-    conn.commit()
-
-
-def save_prediction(conn, match_id, team_a, team_b, p_a, p_draw, p_b):
-    existing = conn.execute(
-        "SELECT id FROM predictions WHERE match_id = ?", (match_id,)
-    ).fetchone()
-    if existing:
-        return  # прогноз на этот матч уже сохранён — не дублируем
-    conn.execute("""
-        INSERT INTO predictions
-            (match_id, predicted_at, home_team, away_team, p_home, p_draw, p_away, model_version)
-        VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?)
-    """, (match_id, team_a, team_b, p_a, p_draw, p_b, MODEL_VERSION))
     conn.commit()
 
 
@@ -596,11 +528,19 @@ async def cmd_totals(message: Message):
 
 @dp.message(Command("simulate"))
 async def cmd_simulate(message: Message):
-    """Разыгрывает ближайшие матчи 100 000 раз случайным образом (Монте-Карло),
-    вместо точного расчёта — для наглядности, что итог должен сходиться
-    к тем же цифрам, что и /totals."""
+    """Разыгрывает ближайшие матчи 1 000 000 раз случайным образом
+    (Монте-Карло). Источник λ_home/λ_away — та же DixonColesModel, что и
+    /totals (dixon_coles_model.py, фитится по cron на 12 сезонах истории +
+    текущем сезоне). Раньше здесь была отдельная грубая build_attack_defense/
+    poisson_summary, которая считала атаку/защиту ТОЛЬКО по текущему
+    сезону — в начале сезона (мало сыгранных матчей) это давало пустые
+    словари и одинаковые λ=1.50-1.50 для любой пары команд. Сама механика
+    симуляции (simulate_match) не менялась — только источник λ."""
+    model = await ensure_dc_model(message)
+    if model is None:
+        return
+
     conn = sqlite3.connect(DB_PATH)
-    finished = load_finished_matches(conn, competition_code="PD")
     upcoming, when = find_upcoming_matches(conn, competition_code="PD")
     conn.close()
 
@@ -608,25 +548,20 @@ async def cmd_simulate(message: Message):
         await message.answer("Не найдено предстоящих матчей Ла Лиги.")
         return
 
-    attack, defense, league_avg = build_attack_defense(finished)
     n = 1000000
-
     lines = [f"🎲 Симуляция {n} раз, Ла Лига ({when} UTC):\n"]
-    if not finished:
-        lines.append(
-            "⚠ Сезон ещё не начался (нет сыгранных матчей в базе) — цифры ниже "
-            "усреднены по лиге, а не по конкретным командам.\n"
-        )
     for match_id, team_a, team_b in upcoming:
-        att_a, def_a = attack.get(team_a, 1.0), defense.get(team_a, 1.0)
-        att_b, def_b = attack.get(team_b, 1.0), defense.get(team_b, 1.0)
-        lam_a = att_a * def_b * league_avg
-        lam_b = att_b * def_a * league_avg
+        result = model.predict_totals(team_a, team_b)
+        lam_a, lam_b = result["lambda_home"], result["lambda_away"]
 
         wins_a, draws, wins_b, score_counter = simulate_match(lam_a, lam_b, n)
         top5 = sorted(score_counter.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
         lines.append(f"<b>{team_a} — {team_b}</b>  (λ = {lam_a:.2f} — {lam_b:.2f})")
+        if not result["home_known"]:
+            lines.append(f"⚠ {team_a} — нет истории в модели (средний уровень лиги)")
+        if not result["away_known"]:
+            lines.append(f"⚠ {team_b} — нет истории в модели (средний уровень лиги)")
         lines.append(f"{team_a} победила: {wins_a} раз ({wins_a/n*100:.1f}%)")
         lines.append(f"Ничья: {draws} раз ({draws/n*100:.1f}%)")
         lines.append(f"{team_b} победила: {wins_b} раз ({wins_b/n*100:.1f}%)")
